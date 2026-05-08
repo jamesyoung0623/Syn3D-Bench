@@ -34,7 +34,7 @@ from train_hsic import (
 class VIBOptions(BaseOptions):
     def initialize(self, parser):
         parser = super().initialize(parser)
-        parser.add_argument('--n_trials', type=int, default=5,
+        parser.add_argument('--n_trials', type=int, default=100,
                             help='number of Optuna trials to run')
         parser.add_argument('--beta_min', type=float, default=5e-4,
                             help='minimum beta (inclusive) for log-uniform search')

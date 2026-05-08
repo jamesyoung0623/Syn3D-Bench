@@ -1,0 +1,13 @@
+train_multimodal.py
+train_plain.py
+train_videos.py
+extract_image_features_ddp_shapenet.py
+extract_video_features_ddp_instantmesh.py
+extract_video_features_ddp_lgm.py
+extract_video_features_ddp_sam3d.py
+extract_video_features_ddp_trellis.py
+extract_video_features_ddp_trellis_text.py
+.codex
+__pycache__/
+*.pyc
+/internvl3_finetune/checkpoints/

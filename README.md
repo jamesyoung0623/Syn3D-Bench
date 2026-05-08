@@ -9,7 +9,7 @@ entry points:
 Both methods train ShapeNet as the real dataset against one generated fake
 dataset, using precomputed point-cloud feature tensors.
 
-## Setup
+## Running From Repository Root
 
 Run commands from the repository root because the training scripts use relative
 paths such as `datasets/PCs`, `train_ids.txt`, `val_ids.txt`, and
@@ -17,32 +17,6 @@ paths such as `datasets/PCs`, `train_ids.txt`, `val_ids.txt`, and
 
 ```bash
 cd /path/to/Syn3D-Bench
-```
-
-Create and activate a Conda environment. Python 3.10 is recommended.
-
-```bash
-conda create -n syn3d-bench python=3.10 -y
-conda activate syn3d-bench
-```
-
-Install PyTorch for your CUDA version. For example, CUDA 11.7:
-
-```bash
-pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 \
-  --extra-index-url https://download.pytorch.org/whl/cu117
-```
-
-If you do not need CUDA, install CPU PyTorch instead:
-
-```bash
-pip install torch==1.13.1 torchvision==0.14.1
-```
-
-Install the remaining dependencies:
-
-```bash
-pip install numpy scikit-learn optuna tensorboardX huggingface_hub
 ```
 
 Each wrapper trains the same six point-cloud feature settings:
@@ -140,7 +114,7 @@ Each lambda run directory contains:
 VIB-Net training uses `train_vib.py`. It runs Optuna over VIB `beta` and
 learning rate. Defaults:
 
-- `--n_trials 5`
+- `--n_trials 100`
 - `--beta_min 5e-4`
 - `--beta_max 1e-1`
 - `--lr_min 1e-5`
@@ -218,37 +192,35 @@ The Syn3D feature dataset is hosted on Hugging Face:
 https://huggingface.co/datasets/jamesyoung0623/Syn3D-Dataset
 ```
 
-Install the Hugging Face Hub CLI if needed:
-
-```bash
-pip install -U huggingface_hub
-```
-
-Download the dataset into the repository `datasets/` directory:
+Download the feature archives into the repository root with the Hugging Face
+Hub CLI. The remote paths already start with `datasets/`, so using the
+repository root as `--local-dir` preserves the expected `datasets/PCs` layout.
 
 ```bash
 cd /path/to/Syn3D-Bench
-mkdir -p datasets
 huggingface-cli download jamesyoung0623/Syn3D-Dataset \
   --repo-type dataset \
-  --local-dir datasets
+  --include "datasets/PCs/**" \
+  --local-dir .
 ```
 
-After download, confirm the point-cloud feature tree exists:
+The feature folders are stored as split `.tar.gz` archives. Extract each
+backbone's parts before training:
 
 ```bash
-ls datasets/PCs
+cd /path/to/Syn3D-Bench
+find datasets/PCs -name '*.part*.tar.gz' -print0 | while IFS= read -r -d '' shard; do
+  tar -xzf "$shard" -C "$(dirname "$shard")"
+done
 ```
 
-The training scripts expect paths such as:
+After extraction, confirm the point-cloud feature tree contains `.pt` tensors
+at paths such as:
 
 ```text
 datasets/PCs/Shapenet/ULIP-2/pointnext/*.pt
 datasets/PCs/InstantMesh/ULIP-2/pointnext/*.pt
 ```
-
-If your download tool creates an extra nesting level, move or symlink the
-downloaded `PCs` directory so it is available at `datasets/PCs`.
 
 ## Expected Data Layout
 
@@ -293,6 +265,128 @@ Dataset abbreviations used in checkpoint names:
 - `SS`: ShapeNet + SAM3D
 - `ST`: ShapeNet + TRELLIS
 - `STT`: ShapeNet + TRELLIS_text
+
+## Vision-Language Inference
+
+The inference scripts run VLM classification over rendered videos from all six
+project folders:
+
+- `ULIP`
+- `InstantMesh`
+- `LGM`
+- `SAM3D`
+- `TRELLIS`
+- `TRELLIS_text`
+
+Shared project iteration, output paths, and optional logging live in
+`inference_common.py`. By default, it looks for project folders under
+`/path/to/project/root`. Override this root with:
+
+```bash
+export SYN3D_PROJECT_ROOT=/path/to/project/root
+```
+
+The default video folders are:
+
+```text
+ULIP/ulip/ULIP_Shapenet_Triplets/videos_white
+InstantMesh/outputs/videos_white
+LGM/outputs/videos_white
+SAM3D/outputs/videos_black
+TRELLIS/outputs/videos_black
+TRELLIS_text/outputs_text/videos_black
+```
+
+Each model script loops over all six projects and writes one result JSON into
+each project directory:
+
+```bash
+cd /path/to/Syn3D-Bench
+python inference_Idefics2.py
+python inference_InternVL2.py
+python inference_InternVL3.py
+python inference_LLAVA.py
+python inference_LongVA.py
+python inference_Mantis.py
+python inference_mPLUG-Owl3.py
+python inference_Phi.py
+python inference_Qwen2-VL.py
+python inference_VILA.py
+```
+
+Common helper files:
+
+- `inference_common.py`: dataset/project iteration, video path resolution, and
+  log tee setup.
+- `inference_phi35_common.py`: shared Phi-3.5-Vision inference implementation
+  used by `inference_Phi.py`.
+
+Example outputs:
+
+```text
+/path/to/project/root/ULIP/llava_ov_7b_all_results.json
+/path/to/project/root/InstantMesh/llava_ov_7b_all_results.json
+/path/to/project/root/SAM3D/llava_ov_7b_all_results.json
+```
+
+### InternVL3 Fine-Tuning And Inference
+
+`run_internvl3_finetuned.sh` combines InternVL3 SFT training and inference for
+the five fine-tuning combos:
+
+```text
+SI SL SS ST STT
+```
+
+Usage:
+
+```bash
+cd /path/to/Syn3D-Bench
+./run_internvl3_finetuned.sh train
+./run_internvl3_finetuned.sh infer
+./run_internvl3_finetuned.sh all
+```
+
+`all` is the default mode. The training entrypoint is
+`train_internvl3_sft.py` in this repository. The script expects fine-tuning
+JSONL files and checkpoints under:
+
+```text
+internvl3_finetune/
+```
+
+Override paths and runtime settings with environment variables:
+
+```bash
+ROOT_DIR=/path/to/root \
+INTERNVL3_FINETUNE_ROOT=/path/to/internvl3_finetune \
+INTERNVL3_MODEL_NAME=OpenGVLab/InternVL3_5-4B-Instruct \
+INTERNVL3_MODEL_SIZE=4B \
+INTERNVL3_RUN_TAG=internvl3_5_4b \
+INTERNVL3_CUDA_VISIBLE_DEVICES=0,1 \
+INTERNVL3_NPROC_PER_NODE=2 \
+./run_internvl3_finetuned.sh all
+```
+
+`INTERNVL3_MODEL_NAME`, `INTERNVL3_MODEL_SIZE`, and `INTERNVL3_RUN_TAG` are
+required. Checkpoints are written under
+`internvl3_finetune/checkpoints/<INTERNVL3_RUN_TAG>_<COMBO>_sft/`. For the 4B
+InternVL3.5 checkpoint:
+
+```bash
+INTERNVL3_MODEL_NAME=OpenGVLab/InternVL3_5-4B-Instruct \
+INTERNVL3_MODEL_SIZE=4B \
+INTERNVL3_RUN_TAG=internvl3_5_4b \
+./run_internvl3_finetuned.sh all
+```
+
+InternVL3 inference also supports model/runtime overrides, for example:
+
+```bash
+INTERNVL3_MODEL_NAME=OpenGVLab/InternVL3-2B \
+INTERNVL3_FINETUNE_DIR=/path/to/checkpoint-final \
+python inference_InternVL3.py
+```
 
 ## Evaluation
 
