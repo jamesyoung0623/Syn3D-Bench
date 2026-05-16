@@ -29,7 +29,7 @@ PROJECT_SPECS = {
     "ShapeNet": ProjectSpec(
         name="ShapeNet",
         dataset="ShapeNet",
-        label="human-created",
+        label="real",
         videos_root=project_videos_root("ULIP"),
     ),
     "InstantMesh": ProjectSpec(

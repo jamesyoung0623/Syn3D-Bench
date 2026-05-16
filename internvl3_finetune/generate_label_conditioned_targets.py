@@ -32,7 +32,7 @@ from inference_InternVL3 import (
 
 setup_run_logging("internvl3_pseudolabel", __file__)
 
-VALID_LABELS = {"human-created", "synthetic", "uncertain"}
+VALID_LABELS = {"real", "synthetic", "uncertain"}
 
 
 @dataclass
@@ -45,7 +45,7 @@ class PseudoLabelArguments:
     minimum_num_sampled_frames: int = 1
     max_tiles_per_frame: int = 1
     use_thumbnail: bool = True
-    max_new_tokens: int = 256
+    max_new_tokens: int = 128
     device_map_mode: str = "auto"
     load_in_8bit: bool = False
     dtype: str = "auto"
@@ -198,7 +198,7 @@ The gold label for the asset's origin is fixed:
 - "{label}"
 
 Definitions:
-- "human-created": primarily authored by a person through manual modeling, sculpting, CAD design, manual assembly, or substantial human cleanup.
+- "real": primarily authored by a person through manual modeling, sculpting, CAD design, manual assembly, or substantial human cleanup.
 - "synthetic": primarily produced by an automatic generative system such as text-to-3D, image-to-3D, reconstruction, diffusion-based generation, or procedural/generative modeling.
 - "uncertain": the visible evidence is insufficient to reliably determine whether the asset was primarily human-authored or machine-generated.
 
@@ -209,7 +209,7 @@ Important rules:
 2. Base your explanation only on diagnostic evidence about the underlying 3D asset's origin.
 3. Ignore rendering consistency by itself. Multiple views, black backgrounds, or consistent lighting are not diagnostic on their own.
 4. If the provided label is weakly supported by the visible evidence, explain the uncertainty or mismatch in the reason.
-5. For "human-created", focus on signs of deliberate design intent, coherent part structure, functional details, and plausible geometry.
+5. For "real", focus on signs of deliberate design intent, coherent part structure, functional details, and plausible geometry.
 6. For "synthetic", focus on generative artifacts, repeated or nonsensical structure, over-smoothing, merged parts, or implausible geometry.
 7. For "uncertain", explain why the visible evidence is not diagnostic.
 
