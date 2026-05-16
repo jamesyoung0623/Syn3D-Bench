@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
 
@@ -67,9 +68,12 @@ def configure_vision_gradient_checkpointing(model, enabled: bool) -> None:
 
 @dataclass
 class ModelDataArguments:
-    model_name: str = "OpenGVLab/InternVL3-1B"
-    train_jsonl: str = ""
+    model_name: str = "OpenGVLab/InternVL3_5-2B-Instruct"
+    train_jsonl: str = "internvl3_finetune/train_full_ST_consensus_uncertain.jsonl"
     eval_jsonl: str | None = None
+    init_finetune_dir: str = ""
+    init_projector_path: str = ""
+    init_llm_adapter_path: str = ""
     image_size: int = 448
     num_sampled_frames: int = 12
     max_tiles_per_frame: int = 1
@@ -78,12 +82,26 @@ class ModelDataArguments:
     freeze_vision: bool = True
     tune_projector: bool = True
     llm_lora: bool = True
-    lora_r: int = 16
+    lora_r: int = 4
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-    projector_learning_rate: float = 2e-4
-    llm_learning_rate: float = 2e-5
+    projector_learning_rate: float = 5e-5
+    llm_learning_rate: float = 1e-5
+
+
+@dataclass
+class ScriptTrainingArguments(TrainingArguments):
+    output_dir: str = "internvl3_finetune/checkpoints/internvl3_2b_lora_4_ST_consensus_uncertain_reason_sft"
+    per_device_train_batch_size: int = 1
+    gradient_accumulation_steps: int = 2
+    num_train_epochs: float = 10
+    logging_steps: float = 1
+    save_strategy: str = "epoch"
+    save_total_limit: int = 3
+    bf16: bool = True
+    gradient_checkpointing: bool = True
+    warmup_ratio: float = 0.1
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -125,7 +143,7 @@ def format_target_json(example: dict[str, Any]) -> str:
         }
 
     label = str(target_json["label"])
-    if label not in {"human-created", "synthetic", "uncertain"}:
+    if label not in {"real", "synthetic", "uncertain"}:
         raise ValueError(f"Unsupported label: {label!r}")
 
     if "reason" in target_json:
@@ -335,16 +353,55 @@ def freeze_model_for_projector_plus_llm_lora(model, args: ModelDataArguments) ->
         model.mlp1.requires_grad_(True)
 
 
+def resolve_initial_finetune_paths(args: ModelDataArguments) -> tuple[str, str]:
+    projector_path = args.init_projector_path.strip()
+    llm_adapter_path = args.init_llm_adapter_path.strip()
+
+    if args.init_finetune_dir.strip():
+        init_dir = Path(args.init_finetune_dir)
+        if not projector_path:
+            candidate = init_dir / "projector.pt"
+            if candidate.exists():
+                projector_path = str(candidate)
+        if not llm_adapter_path:
+            candidate = init_dir / "llm_adapter"
+            if candidate.exists():
+                llm_adapter_path = str(candidate)
+
+    return projector_path, llm_adapter_path
+
+
+def load_initial_projector_weights(model, args: ModelDataArguments) -> None:
+    projector_path, _ = resolve_initial_finetune_paths(args)
+    if not projector_path:
+        return
+
+    projector_state = torch.load(projector_path, map_location="cpu")
+    model.mlp1.load_state_dict(projector_state, strict=True)
+    print(f"Loaded initial finetuned projector from {projector_path}")
+
+
 def attach_llm_lora(model, args: ModelDataArguments):
     if not args.llm_lora:
         return model
 
     try:
-        from peft import LoraConfig, TaskType, get_peft_model
+        from peft import LoraConfig, PeftModel, TaskType, get_peft_model
     except ImportError as exc:
         raise ImportError(
             "LLM LoRA requires `peft`. Install it with `python -m pip install peft`."
         ) from exc
+
+    _, llm_adapter_path = resolve_initial_finetune_paths(args)
+    if llm_adapter_path:
+        model.language_model = PeftModel.from_pretrained(
+            model.language_model,
+            llm_adapter_path,
+            is_trainable=True,
+        )
+        model.language_model.print_trainable_parameters()
+        print(f"Loaded initial trainable LLM adapter from {llm_adapter_path}")
+        return model
 
     target_modules = [name.strip() for name in args.lora_target_modules.split(",") if name.strip()]
     lora_config = LoraConfig(
@@ -508,7 +565,7 @@ class InternVL3SFTTrainer(Trainer):
 def main() -> None:
     patch_checkpoint_use_reentrant_default()
 
-    parser = HfArgumentParser((ModelDataArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelDataArguments, ScriptTrainingArguments))
     model_args, training_args = parser.parse_args_into_dataclasses()
     training_args.remove_unused_columns = False
 
@@ -550,6 +607,7 @@ def main() -> None:
     model.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     model.config.use_cache = False
 
+    load_initial_projector_weights(model, model_args)
     freeze_model_for_projector_plus_llm_lora(model, model_args)
     attach_llm_lora(model, model_args)
 

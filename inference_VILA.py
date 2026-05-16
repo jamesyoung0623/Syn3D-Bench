@@ -120,7 +120,7 @@ output_path = Path()
 
 num_sampled_frames = 12
 batch_size = 1
-max_new_tokens = 256
+max_new_tokens = 128
 max_videos = 1000
 sample_seed = 0
 
@@ -183,13 +183,13 @@ You are analyzing multiple rendered images of the same 3D asset.
 Your goal is to infer the origin of the underlying 3D model, not to describe the rendered views.
 
 Decide whether the underlying 3D model is:
-- "human-created"
+- "real"
 - "synthetic"
 - "uncertain"
 
 Definitions:
 
-- "human-created":
+- "real":
   The underlying 3D asset was primarily authored by a person through manual modeling, sculpting, CAD design, manual assembly, or substantial human editing/cleanup. A human determined most of the geometry, part structure, and important design details.
 
 - "synthetic":
@@ -213,7 +213,7 @@ Important rules:
    - signs of manual design intent
    - signs of procedural/generative artifacts
 4. Ignore the fact that these are rendered images by themselves. Multiple views, consistent camera, or consistent lighting are NOT sufficient evidence for either class.
-5. For "human-created", the reason should point to evidence of deliberate manual design, functional structure, meaningful detail placement, or coherent asset construction.
+5. For "real", the reason should point to evidence of deliberate manual design, functional structure, meaningful detail placement, or coherent asset construction.
 6. For "synthetic", the reason should point to evidence of generative artifacts, implausible geometry, repeated or nonsensical structure, over-smoothing, inconsistent semantics, or missing/merged functional parts.
 7. For "uncertain", the reason should explain exactly why the visible evidence is not diagnostic.
 
@@ -225,7 +225,7 @@ Output requirements:
 
 Return JSON with this schema:
 {{
-  "label": "human-created" | "synthetic" | "uncertain",
+  "label": "real" | "synthetic" | "uncertain",
   "reason": "one-sentence reason"
 }}
 """.strip()

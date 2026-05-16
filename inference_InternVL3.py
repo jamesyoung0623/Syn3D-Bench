@@ -27,14 +27,11 @@ setup_run_logging("internvl3", __file__)
 
 
 SUPPORTED_INTERNVL3_MODELS = {
-    "1B": "OpenGVLab/InternVL3-1B",
-    "2B": "OpenGVLab/InternVL3-2B",
+    "1B": "OpenGVLab/InternVL3_5-1B-Instruct",
+    "2B": "OpenGVLab/InternVL3_5-2B-Instruct",
     "4B": "OpenGVLab/InternVL3_5-4B-Instruct",
-    "8B": "OpenGVLab/InternVL3-8B",
-    "9B": "OpenGVLab/InternVL3-9B",
-    "14B": "OpenGVLab/InternVL3-14B",
-    "38B": "OpenGVLab/InternVL3-38B",
-    "78B": "OpenGVLab/InternVL3-78B",
+    "8B": "OpenGVLab/InternVL3_5-8B-Instruct",
+    "14B": "OpenGVLab/InternVL3_5-14B-Instruct",
 }
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -59,7 +56,7 @@ class ProjectDefaults:
     minimum_num_sampled_frames: int = 1
     max_tiles_per_frame: int = 1
     use_thumbnail: bool = True
-    max_new_tokens: int = 256
+    max_new_tokens: int = 128
     device_map_mode: str = "auto"
     load_in_8bit: bool = False
 
@@ -70,6 +67,7 @@ class RuntimeSettings:
     model_size: str
     videos_root: Path
     output_path: Path
+    exclude_object_ids_path: Path | None
     num_sampled_frames: int
     batch_size: int
     max_videos: int
@@ -206,6 +204,11 @@ def build_runtime_settings(defaults: ProjectDefaults) -> RuntimeSettings:
         model_size=model_size,
         videos_root=videos_root,
         output_path=output_path,
+        exclude_object_ids_path=(
+            Path(exclude_path)
+            if (exclude_path := os.environ.get("INTERNVL3_EXCLUDE_OBJECT_IDS_PATH", "").strip())
+            else None
+        ),
         num_sampled_frames=parse_int_env("INTERNVL3_NUM_SAMPLED_FRAMES", defaults.num_sampled_frames),
         batch_size=parse_int_env("INTERNVL3_BATCH_SIZE", defaults.batch_size),
         max_videos=parse_int_env("INTERNVL3_MAX_VIDEOS", defaults.max_videos),
@@ -475,13 +478,13 @@ You are analyzing multiple rendered images of the same 3D asset.
 Your goal is to infer the origin of the underlying 3D model, not to describe the rendered views.
 
 Decide whether the underlying 3D model is:
-- "human-created"
+- "real"
 - "synthetic"
 - "uncertain"
 
 Definitions:
 
-- "human-created":
+- "real":
   The underlying 3D asset was primarily authored by a person through manual modeling, sculpting, CAD design, manual assembly, or substantial human editing/cleanup. A human determined most of the geometry, part structure, and important design details.
 
 - "synthetic":
@@ -505,7 +508,7 @@ Important rules:
    - signs of manual design intent
    - signs of procedural/generative artifacts
 4. Ignore the fact that these are rendered images by themselves. Multiple views, consistent camera, or consistent lighting are NOT sufficient evidence for either class.
-5. For "human-created", the reason should point to evidence of deliberate manual design, functional structure, meaningful detail placement, or coherent asset construction.
+5. For "real", the reason should point to evidence of deliberate manual design, functional structure, meaningful detail placement, or coherent asset construction.
 6. For "synthetic", the reason should point to evidence of generative artifacts, implausible geometry, repeated or nonsensical structure, over-smoothing, inconsistent semantics, or missing/merged functional parts.
 7. For "uncertain", the reason should explain exactly why the visible evidence is not diagnostic.
 
@@ -517,7 +520,7 @@ Output requirements:
 
 Return JSON with this schema:
 {
-  "label": "human-created" | "synthetic" | "uncertain",
+  "label": "real" | "synthetic" | "uncertain",
   "reason": "one-sentence reason"
 }
 """.strip()
@@ -653,6 +656,10 @@ def chunk_list(items, size):
 
 def select_video_paths(settings: RuntimeSettings) -> list[Path]:
     video_paths = sorted(settings.videos_root.glob("*.mp4"))
+    if settings.exclude_object_ids_path is not None:
+        with settings.exclude_object_ids_path.open("r", encoding="utf-8") as handle:
+            excluded = {line.strip() for line in handle if line.strip()}
+        video_paths = [path for path in video_paths if path.stem not in excluded]
     if len(video_paths) > settings.max_videos:
         video_paths = sorted(random.Random(settings.sample_seed).sample(video_paths, settings.max_videos))
     return video_paths
