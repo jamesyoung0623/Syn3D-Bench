@@ -1,25 +1,43 @@
 import inspect
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+
+def sanitize_pytorch_cuda_alloc_conf() -> None:
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    if not alloc_conf:
+        return
+
+    entries = [entry.strip() for entry in alloc_conf.split(",") if entry.strip()]
+    supported_entries = [
+        entry for entry in entries if not entry.startswith("expandable_segments:")
+    ]
+    if len(supported_entries) == len(entries):
+        return
+    if supported_entries:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(supported_entries)
+    else:
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
+
+sanitize_pytorch_cuda_alloc_conf()
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import cv2
 import numpy as np
 import torch
 import torch.utils.checkpoint as torch_checkpoint
+import transformers
 from PIL import Image
 from torch.optim import AdamW
 from torch.utils.data import Dataset
 from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForVision2Seq,
     AutoProcessor,
     HfArgumentParser,
     Trainer,
@@ -41,6 +59,21 @@ setup_run_logging("qwen2vl_train", __file__)
 VALID_LABELS = {"real", "synthetic", "uncertain"}
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 PLACEHOLDER_TOKEN = "<|placeholder|>"
+
+
+class IgnoreKnownTrainingNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        ignored_patterns = (
+            "`torch_dtype` is deprecated! Use `dtype` instead!",
+            "`use_return_dict` is deprecated! Use `return_dict` instead!",
+            "warmup_ratio is deprecated and will be removed in v5.2",
+        )
+        return not any(pattern in message for pattern in ignored_patterns)
+
+
+for logger_name in ("transformers.configuration_utils", "transformers.training_args"):
+    logging.getLogger(logger_name).addFilter(IgnoreKnownTrainingNoise())
 
 
 @dataclass
@@ -75,7 +108,7 @@ class ScriptTrainingArguments(TrainingArguments):
     save_total_limit: int = 3
     bf16: bool = True
     gradient_checkpointing: bool = True
-    warmup_ratio: float = 0.1
+    warmup_ratio: float | None = None
 
 
 def patch_checkpoint_use_reentrant_default() -> None:
@@ -328,6 +361,23 @@ def longest_common_prefix(left: list[int], right: list[int]) -> int:
     return prefix_length
 
 
+def get_processor_tokenizer(processor, model_name: str):
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        raise RuntimeError(
+            "AutoProcessor did not return a multimodal processor with `.tokenizer` for "
+            f"{model_name}. This usually means the installed `transformers` build does not "
+            "support this model family yet. For Qwen3-VL, install the latest Transformers "
+            "from source: `pip install -U git+https://github.com/huggingface/transformers`."
+        )
+    if not hasattr(processor, "image_processor"):
+        raise RuntimeError(
+            "AutoProcessor did not return an image processor for "
+            f"{model_name}. Upgrade `transformers` to a build with Qwen3-VL support."
+        )
+    return tokenizer
+
+
 class Qwen2VLSFTDataset(Dataset):
     def __init__(self, examples: list[dict[str, Any]], processor, args: ModelDataArguments) -> None:
         self.examples = examples
@@ -352,6 +402,7 @@ class Qwen2VLSFTDataset(Dataset):
 class Qwen2VLDataCollator:
     def __init__(self, processor, max_length: int):
         self.processor = processor
+        self.tokenizer = get_processor_tokenizer(processor, "the selected model")
         self.max_length = max_length
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
@@ -381,7 +432,7 @@ class Qwen2VLDataCollator:
             expanded_prompt_texts.append(expand_image_pad_tokens(prompt_text, grid_slice, merge_size))
             grid_offset += image_count
 
-        prompt_inputs = self.processor.tokenizer(
+        prompt_inputs = self.tokenizer(
             expanded_prompt_texts,
             truncation=True,
             max_length=self.max_length,
@@ -425,21 +476,38 @@ def resolve_initial_adapter_path(args: ModelDataArguments) -> str:
     return ""
 
 
+def iter_auto_model_classes():
+    for class_name in (
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModelForCausalLM",
+    ):
+        model_cls = getattr(transformers, class_name, None)
+        if model_cls is not None:
+            yield model_cls
+
+
 def load_model(args: ModelDataArguments, torch_dtype: torch.dtype):
     load_errors = []
     load_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": torch_dtype,
+        "dtype": torch_dtype,
         "low_cpu_mem_usage": True,
     }
     if args.attn_implementation.strip():
         load_kwargs["attn_implementation"] = args.attn_implementation.strip()
 
-    for model_cls in (AutoModelForVision2Seq, AutoModelForCausalLM):
+    for model_cls in iter_auto_model_classes():
         try:
             return model_cls.from_pretrained(args.model_name, **load_kwargs)
         except Exception as exc:
             load_errors.append(f"{model_cls.__name__}: {exc}")
+
+    if not load_errors:
+        raise RuntimeError(
+            "No compatible Transformers auto model class is available. "
+            "If you upgraded Transformers for Qwen3-VL, also upgrade PyTorch to >= 2.4."
+        )
 
     raise RuntimeError(
         "Failed to load Qwen2-VL for training with the installed transformers setup.\n"
@@ -674,9 +742,10 @@ def main() -> None:
         min_pixels=model_args.frame_min_pixels,
         max_pixels=model_args.frame_max_pixels,
     )
-    if processor.tokenizer.pad_token is None:
-        processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "right"
+    processor_tokenizer = get_processor_tokenizer(processor, model_args.model_name)
+    if processor_tokenizer.pad_token is None:
+        processor_tokenizer.pad_token = processor_tokenizer.eos_token
+    processor_tokenizer.padding_side = "right"
 
     model = load_model(model_args, training_dtype)
     if hasattr(model, "config"):
@@ -707,7 +776,7 @@ def main() -> None:
     trainer_processor_kwargs = (
         {"processing_class": processor}
         if "processing_class" in trainer_class_params
-        else {"tokenizer": processor.tokenizer}
+        else {"tokenizer": processor_tokenizer}
     )
 
     trainer = Qwen2VLSFTTrainer(
@@ -731,5 +800,13 @@ def main() -> None:
         print(f"Saved final finetuned artifacts to {final_output_dir}")
 
 
+def cleanup_distributed_process_group() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed_process_group()

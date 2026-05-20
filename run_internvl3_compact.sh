@@ -4,15 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-MODEL_NAME="${INTERNVL3_MODEL_NAME:-OpenGVLab/InternVL3_5-2B-Instruct}"
-MODEL_SIZE="${INTERNVL3_MODEL_SIZE:-2B}"
+MODEL_NAME="${INTERNVL3_MODEL_NAME:-OpenGVLab/InternVL3_5-4B-Instruct}"
+MODEL_SIZE="${INTERNVL3_MODEL_SIZE:-4B}"
 MODEL_SIZE_SLUG="${MODEL_SIZE,,}"
+DATASET_TAG="${INTERNVL3_DATASET_TAG:-SI}"
 MAX_VIDEOS="${INTERNVL3_MAX_VIDEOS:-100}"
+NUM_SAMPLED_FRAMES="${INTERNVL3_NUM_SAMPLED_FRAMES:-6}"
 CHECKPOINT_ROOT="${INTERNVL3_CHECKPOINT_ROOT:-${SCRIPT_DIR}/internvl3_finetune/checkpoints}"
 EXCLUDE_OBJECT_IDS_PATH="${INTERNVL3_EXCLUDE_OBJECT_IDS_PATH:-${SCRIPT_DIR}/internvl3_finetune/train_reason_replay_object_ids.txt}"
 
 LORA_RANKS=(${INTERNVL3_LORA_RANKS:-4 8 16 32})
-CHECKPOINTS=(${INTERNVL3_CHECKPOINTS:-224 252 final})
+CHECKPOINTS=(${INTERNVL3_CHECKPOINTS:-28 56 84 112 final})
 
 if [[ -f "${EXCLUDE_OBJECT_IDS_PATH}" ]]; then
   export INTERNVL3_EXCLUDE_OBJECT_IDS_PATH="${EXCLUDE_OBJECT_IDS_PATH}"
@@ -23,8 +25,8 @@ elif [[ -n "${INTERNVL3_EXCLUDE_OBJECT_IDS_PATH:-}" ]]; then
 fi
 
 for lora_r in "${LORA_RANKS[@]}"; do
-  run_tag="internvl3_${MODEL_SIZE_SLUG}_lora_${lora_r}_SI_consensus_uncertain_reason_sft"
-  output_base="internvl3_${MODEL_SIZE_SLUG}_lora_${lora_r}_SI_consensus_uncertain"
+  run_tag="internvl3_${MODEL_SIZE_SLUG}_lora_${lora_r}_${DATASET_TAG}_consensus_uncertain_reason_sft"
+  output_base="internvl3_${MODEL_SIZE_SLUG}_lora_${lora_r}_${DATASET_TAG}_consensus_uncertain"
 
   for checkpoint in "${CHECKPOINTS[@]}"; do
     if [[ "${checkpoint}" == "final" ]]; then
@@ -41,6 +43,7 @@ for lora_r in "${LORA_RANKS[@]}"; do
     INTERNVL3_FINETUNE_DIR="${CHECKPOINT_ROOT}/${run_tag}/${checkpoint_dir}" \
     INTERNVL3_OUTPUT_TAG="${output_tag}" \
     INTERNVL3_MAX_VIDEOS="${MAX_VIDEOS}" \
+    INTERNVL3_NUM_SAMPLED_FRAMES="${NUM_SAMPLED_FRAMES}" \
     python inference_InternVL3.py
   done
 done

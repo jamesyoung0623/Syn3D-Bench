@@ -12,13 +12,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import torch
 from PIL import Image
 import torchvision.transforms as T
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers.generation.utils import GenerationMixin
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
 
 from inference_common import PROJECT_NAMES, project_root, project_videos_root, setup_run_logging
 
@@ -35,12 +36,87 @@ SUPPORTED_INTERNVL3_MODELS = {
 }
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+VALID_LABELS = {"real", "synthetic", "uncertain"}
 
 warnings.filterwarnings(
     "ignore",
     message=r"`Qwen2VLRotaryEmbedding` can now be fully parameterized.*",
     category=FutureWarning,
 )
+
+
+def load_internvl3_tokenizer(model_name: str):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            use_fast=False,
+        )
+    except ValueError as exc:
+        if "Couldn't instantiate the backend tokenizer" not in str(exc):
+            raise
+        tokenizer = Qwen2Tokenizer.from_pretrained(model_name)
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def patch_transformers_tied_weights_keys_compat() -> None:
+    if not getattr(
+        PreTrainedModel.__init__,
+        "_internvl3_tied_weights_default_patched",
+        False,
+    ):
+        original_init = PreTrainedModel.__init__
+
+        def init_with_tied_weight_default(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            if "all_tied_weights_keys" not in self.__dict__:
+                self.all_tied_weights_keys = {}
+
+        init_with_tied_weight_default._internvl3_tied_weights_default_patched = True
+        PreTrainedModel.__init__ = init_with_tied_weight_default
+
+    original_move_missing_keys = getattr(PreTrainedModel, "_move_missing_keys_from_meta_to_device", None)
+    if original_move_missing_keys is not None and not getattr(
+        original_move_missing_keys,
+        "_internvl3_tied_weights_compat_patched",
+        False,
+    ):
+
+        def move_missing_keys_with_tied_weight_fallback(self, missing_keys, *args, **kwargs):
+            if "all_tied_weights_keys" not in self.__dict__ or not self.all_tied_weights_keys:
+                try:
+                    self.all_tied_weights_keys = self.get_expanded_tied_weights_keys(all_submodels=True)
+                except Exception:
+                    self.all_tied_weights_keys = {}
+            return original_move_missing_keys(self, missing_keys, *args, **kwargs)
+
+        move_missing_keys_with_tied_weight_fallback._internvl3_tied_weights_compat_patched = True
+        PreTrainedModel._move_missing_keys_from_meta_to_device = move_missing_keys_with_tied_weight_fallback
+
+    if getattr(
+        GenerationMixin.load_custom_generate,
+        "_internvl3_custom_generate_compat_patched",
+        False,
+    ):
+        return
+
+    original_load_custom_generate = GenerationMixin.load_custom_generate
+
+    def load_custom_generate_with_optional_hub_fallback(self, *args, **kwargs):
+        try:
+            return original_load_custom_generate(self, *args, **kwargs)
+        except RuntimeError as exc:
+            message = str(exc)
+            if "Cannot send a request, as the client has been closed" in message:
+                raise OSError("Optional custom_generate file could not be checked.") from exc
+            raise
+
+    load_custom_generate_with_optional_hub_fallback._internvl3_custom_generate_compat_patched = True
+    GenerationMixin.load_custom_generate = load_custom_generate_with_optional_hub_fallback
 
 
 @dataclass(frozen=True)
@@ -87,7 +163,18 @@ class IgnoreAccelerateP2PWarning(logging.Filter):
         return "older driver with an RTX 4000 series GPU" not in record.getMessage()
 
 
+class IgnoreKnownTransformersNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        ignored_patterns = (
+            "`torch_dtype` is deprecated! Use `dtype` instead!",
+            "`use_return_dict` is deprecated! Use `return_dict` instead!",
+        )
+        return not any(pattern in message for pattern in ignored_patterns)
+
+
 logging.getLogger("accelerate.big_modeling").addFilter(IgnoreAccelerateP2PWarning())
+logging.getLogger("transformers.configuration_utils").addFilter(IgnoreKnownTransformersNoise())
 
 
 def parse_bool_env(name: str, default: bool) -> bool:
@@ -238,8 +325,8 @@ def build_runtime_settings(defaults: ProjectDefaults) -> RuntimeSettings:
     return settings
 
 
-def build_greedy_generation_config(max_new_tokens: int) -> dict:
-    return {
+def build_greedy_generation_config(max_new_tokens: int, tokenizer=None) -> dict:
+    generation_config = {
         "max_new_tokens": max_new_tokens,
         "do_sample": False,
         "temperature": None,
@@ -255,6 +342,15 @@ def build_greedy_generation_config(max_new_tokens: int) -> dict:
         "diversity_penalty": 0.0,
         "length_penalty": 1.0,
     }
+    if tokenizer is not None:
+        pad_token_id = tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = tokenizer.eos_token_id
+        if pad_token_id is not None:
+            generation_config["pad_token_id"] = pad_token_id
+        if tokenizer.eos_token_id is not None:
+            generation_config["eos_token_id"] = tokenizer.eos_token_id
+    return generation_config
 
 
 def sample_video_frames(video_path: Path, num_frames: int) -> list[Image.Image]:
@@ -471,7 +567,7 @@ def build_split_device_map(model_name: str) -> dict:
     return device_map
 
 
-def build_prompt() -> str:
+def build_origin_instructions() -> str:
     return """
 You are analyzing multiple rendered images of the same 3D asset.
 
@@ -511,6 +607,12 @@ Important rules:
 5. For "real", the reason should point to evidence of deliberate manual design, functional structure, meaningful detail placement, or coherent asset construction.
 6. For "synthetic", the reason should point to evidence of generative artifacts, implausible geometry, repeated or nonsensical structure, over-smoothing, inconsistent semantics, or missing/merged functional parts.
 7. For "uncertain", the reason should explain exactly why the visible evidence is not diagnostic.
+""".strip()
+
+
+def build_prompt() -> str:
+    return f"""
+{build_origin_instructions()}
 
 Output requirements:
 - Return valid JSON only.
@@ -519,11 +621,53 @@ Output requirements:
 - Do not repeat the label wording in the reason.
 
 Return JSON with this schema:
-{
+{{
   "label": "real" | "synthetic" | "uncertain",
   "reason": "one-sentence reason"
-}
+}}
 """.strip()
+
+
+def build_label_prompt() -> str:
+    return f"""
+{build_origin_instructions()}
+
+Stage 1 output requirements:
+- Return valid JSON only.
+- Predict only the label.
+- Do not include a reason or any explanation.
+
+Return JSON with this schema:
+{{
+  "label": "real" | "synthetic" | "uncertain"
+}}
+""".strip()
+
+
+def build_reason_prompt(predicted_label: str) -> str:
+    return f"""
+{build_origin_instructions()}
+
+The stage 1 predicted label is: "{predicted_label}".
+
+Stage 2 output requirements:
+- Explain why the stage 1 label was predicted.
+- Do not change, dispute, or restate the label.
+- Return valid JSON only.
+- Provide exactly one reason in one sentence.
+- The reason must cite a diagnostic visual cue.
+- Do not repeat the label wording in the reason.
+
+Return JSON with this schema:
+{{
+  "reason": "one-sentence reason"
+}}
+""".strip()
+
+
+def build_question_for_prompt(num_frames: int, prompt: str) -> str:
+    frame_placeholders = "\n".join(f"Frame {idx + 1}: <image>" for idx in range(num_frames))
+    return f"{frame_placeholders}\n\n{prompt}"
 
 
 def normalize_device_spec(device_spec) -> torch.device:
@@ -554,7 +698,7 @@ def prepare_internvl_inputs(
     model,
     frames: list[Image.Image],
     settings: RuntimeSettings,
-) -> tuple[torch.Tensor, list[int], str]:
+) -> tuple[torch.Tensor, list[int]]:
     transform = build_transform(settings.image_size)
     pixel_values_list = []
     num_patches_list = []
@@ -576,13 +720,74 @@ def prepare_internvl_inputs(
         device=visual_device,
         dtype=settings.torch_dtype,
     )
-    frame_placeholders = "\n".join(f"Frame {idx + 1}: <image>" for idx in range(len(frames)))
-    question = f"{frame_placeholders}\n\n{build_prompt()}"
-    return pixel_values, num_patches_list, question
+    return pixel_values, num_patches_list
+
+
+def parse_label_response(response: str) -> tuple[str | None, object | None, str | None]:
+    stripped = response.strip()
+    parsed = None
+    parse_error = None
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception as error:
+        parse_error = str(error)
+
+    label = None
+    if isinstance(parsed, dict):
+        label = str(parsed.get("label", "")).strip().lower()
+    elif isinstance(parsed, str):
+        label = parsed.strip().lower()
+    elif parsed is None:
+        match = re.search(r"\b(real|synthetic|uncertain)\b", stripped.lower())
+        if match is not None:
+            label = match.group(1)
+
+    if label not in VALID_LABELS:
+        if parse_error is None:
+            parse_error = f"Invalid label response: {response!r}"
+        return None, parsed, parse_error
+
+    return label, parsed if parsed is not None else {"label": label}, None
+
+
+def parse_reason_response(response: str) -> tuple[str | None, object | None, str | None]:
+    stripped = response.strip()
+    parsed = None
+    parse_error = None
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception as error:
+        parse_error = str(error)
+
+    reason = None
+    if isinstance(parsed, dict):
+        raw_reason = parsed.get("reason")
+        if isinstance(raw_reason, str):
+            reason = raw_reason.strip()
+    elif isinstance(parsed, str):
+        reason = parsed.strip()
+    elif parsed is None and stripped:
+        reason = stripped
+
+    if not reason:
+        if parse_error is None:
+            parse_error = f"Missing non-empty reason response: {response!r}"
+        return None, parsed, parse_error
+
+    return reason, parsed if parsed is not None else {"reason": reason}, None
 
 
 def run_inference_on_video(model, tokenizer, video_path: Path, settings: RuntimeSettings) -> dict:
-    generation_config = build_greedy_generation_config(max_new_tokens=settings.max_new_tokens)
+    label_generation_config = build_greedy_generation_config(
+        max_new_tokens=min(settings.max_new_tokens, 32),
+        tokenizer=tokenizer,
+    )
+    reason_generation_config = build_greedy_generation_config(
+        max_new_tokens=settings.max_new_tokens,
+        tokenizer=tokenizer,
+    )
     frame_retry_schedule = build_frame_retry_schedule(
         initial_num_frames=settings.num_sampled_frames,
         minimum_num_sampled_frames=settings.minimum_num_sampled_frames,
@@ -593,29 +798,78 @@ def run_inference_on_video(model, tokenizer, video_path: Path, settings: Runtime
         pixel_values = None
         try:
             sampled_frames = sample_video_frames(video_path, current_num_frames)
-            pixel_values, num_patches_list, question = prepare_internvl_inputs(
+            pixel_values, num_patches_list = prepare_internvl_inputs(
                 model=model,
                 frames=sampled_frames,
                 settings=settings,
             )
+            label_question = build_question_for_prompt(
+                num_frames=len(sampled_frames),
+                prompt=build_label_prompt(),
+            )
 
             with torch.inference_mode():
-                response = model.chat(
+                label_response = model.chat(
                     tokenizer=tokenizer,
                     pixel_values=pixel_values,
-                    question=question,
-                    generation_config=generation_config,
+                    question=label_question,
+                    generation_config=label_generation_config,
                     history=None,
                     return_history=False,
                     num_patches_list=num_patches_list,
                 )
 
+            label, label_parsed, label_parse_error = parse_label_response(label_response)
+            stage_outputs = [
+                {
+                    "stage": "label",
+                    "raw_output": label_response,
+                    "parsed_output": label_parsed,
+                    "parse_error": label_parse_error,
+                }
+            ]
+
+            reason_response = None
+            reason_parsed = None
+            reason_parse_error = None
             parsed = None
-            parse_error = None
-            try:
-                parsed = json.loads(response)
-            except Exception as error:
-                parse_error = str(error)
+            parse_error = label_parse_error
+
+            if label is not None:
+                reason_question = build_question_for_prompt(
+                    num_frames=len(sampled_frames),
+                    prompt=build_reason_prompt(label),
+                )
+                with torch.inference_mode():
+                    reason_response = model.chat(
+                        tokenizer=tokenizer,
+                        pixel_values=pixel_values,
+                        question=reason_question,
+                        generation_config=reason_generation_config,
+                        history=None,
+                        return_history=False,
+                        num_patches_list=num_patches_list,
+                    )
+
+                reason, reason_parsed, reason_parse_error = parse_reason_response(reason_response)
+                stage_outputs.append(
+                    {
+                        "stage": "reason",
+                        "raw_output": reason_response,
+                        "parsed_output": reason_parsed,
+                        "parse_error": reason_parse_error,
+                    }
+                )
+                if reason is not None:
+                    parsed = {
+                        "label": label,
+                        "reason": reason,
+                    }
+                    parse_error = None
+                else:
+                    parse_error = reason_parse_error
+
+            raw_output = json.dumps(parsed, ensure_ascii=False) if parsed is not None else label_response
 
             return {
                 "video_path": str(video_path),
@@ -627,9 +881,11 @@ def run_inference_on_video(model, tokenizer, video_path: Path, settings: Runtime
                 "num_sampled_frames": len(sampled_frames),
                 "num_tiles": sum(num_patches_list),
                 "num_patches_list": num_patches_list,
-                "raw_output": response,
+                "raw_output": raw_output,
                 "parsed_output": parsed,
                 "parse_error": parse_error,
+                "inference_mode": "two_stage_label_then_reason",
+                "stage_outputs": stage_outputs,
             }
         except Exception as error:
             is_last_attempt = attempt_idx == len(frame_retry_schedule) - 1
@@ -666,11 +922,8 @@ def select_video_paths(settings: RuntimeSettings) -> list[Path]:
 
 
 def load_model_and_tokenizer(settings: RuntimeSettings):
-    tokenizer = AutoTokenizer.from_pretrained(
-        settings.model_name,
-        trust_remote_code=True,
-        use_fast=False,
-    )
+    tokenizer = load_internvl3_tokenizer(settings.model_name)
+    patch_transformers_tied_weights_keys_compat()
 
     load_kwargs = {
         "trust_remote_code": True,
@@ -680,9 +933,9 @@ def load_model_and_tokenizer(settings: RuntimeSettings):
 
     if settings.load_in_8bit:
         load_kwargs["load_in_8bit"] = True
-        load_kwargs["torch_dtype"] = torch.bfloat16
+        load_kwargs["dtype"] = torch.bfloat16
     else:
-        load_kwargs["torch_dtype"] = settings.torch_dtype
+        load_kwargs["dtype"] = settings.torch_dtype
 
     if torch.cuda.is_available():
         if settings.device_map_mode == "split" and torch.cuda.device_count() > 1:
@@ -779,7 +1032,14 @@ def main(defaults: ProjectDefaults) -> None:
                 result = run_inference_on_video(model, tokenizer, video_path, settings)
                 all_results.append(result)
 
-                print("Raw output:")
+                if "stage_outputs" in result:
+                    print("Stage outputs:")
+                    for stage_result in result["stage_outputs"]:
+                        print(f"{stage_result['stage']}:")
+                        print(stage_result["raw_output"])
+                    print("Final output:")
+                else:
+                    print("Raw output:")
                 print(result["raw_output"])
                 if result["parsed_output"] is not None:
                     print("Parsed JSON:")

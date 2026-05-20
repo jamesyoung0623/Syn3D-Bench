@@ -11,11 +11,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import torch
+import transformers
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoProcessor
 
 from inference_common import PROJECT_NAMES, project_root, project_videos_root, setup_run_logging
 
@@ -366,10 +365,21 @@ def build_max_memory() -> dict | None:
     return max_memory
 
 
+def iter_auto_model_classes():
+    for class_name in (
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModelForCausalLM",
+    ):
+        model_cls = getattr(transformers, class_name, None)
+        if model_cls is not None:
+            yield model_cls
+
+
 def load_model(settings: RuntimeSettings):
     load_errors = []
     load_kwargs = {
-        "torch_dtype": settings.torch_dtype,
+        "dtype": settings.torch_dtype,
         "trust_remote_code": True,
     }
 
@@ -384,7 +394,7 @@ def load_model(settings: RuntimeSettings):
                 load_kwargs["max_memory"] = max_memory
                 print(f"Using max_memory={max_memory}")
 
-    for model_cls in (AutoModelForVision2Seq, AutoModelForCausalLM):
+    for model_cls in iter_auto_model_classes():
         try:
             return model_cls.from_pretrained(
                 settings.model_name,
@@ -393,6 +403,12 @@ def load_model(settings: RuntimeSettings):
             )
         except Exception as exc:
             load_errors.append(f"{model_cls.__name__}: {exc}")
+
+    if not load_errors:
+        raise RuntimeError(
+            "No compatible Transformers auto model class is available. "
+            "If you upgraded Transformers for Qwen3-VL, also upgrade PyTorch to >= 2.4."
+        )
 
     joined_errors = "\n".join(load_errors)
     raise RuntimeError(
@@ -429,6 +445,12 @@ def load_model_and_processor(settings: RuntimeSettings):
         trust_remote_code=True,
         max_pixels=settings.frame_max_pixels,
     )
+    if not hasattr(processor, "image_processor"):
+        raise RuntimeError(
+            "AutoProcessor did not return an image processor for "
+            f"{settings.model_name}. For Qwen3-VL, upgrade Transformers with "
+            "`pip install -U git+https://github.com/huggingface/transformers`."
+        )
     return model, processor
 
 

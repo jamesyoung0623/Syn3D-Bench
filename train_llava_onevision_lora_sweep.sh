@@ -6,44 +6,39 @@ cd "${SCRIPT_DIR}"
 
 GPU_IDS="${LLAVA_CUDA_VISIBLE_DEVICES:-0,1}"
 NPROC_PER_NODE="${LLAVA_NPROC_PER_NODE:-2}"
+OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export OMP_NUM_THREADS
 HF_HUB_OFFLINE="${LLAVA_HF_HUB_OFFLINE:-${HF_HUB_OFFLINE:-0}}"
-MODEL_SIZE="${LLAVA_MODEL_SIZE:-4B}"
-MODEL_SIZE_SLUG="${MODEL_SIZE,,}"
-case "${MODEL_SIZE_SLUG}" in
-  4b)
-    DEFAULT_MODEL_NAME="lmms-lab/LLaVA-OneVision-1.5-4B-Instruct"
-    DEFAULT_OUTPUT_PREFIX="llava_onevision_lora"
-    ;;
-  8b)
-    DEFAULT_MODEL_NAME="lmms-lab/LLaVA-OneVision-1.5-8B-Instruct"
-    DEFAULT_OUTPUT_PREFIX="llava_onevision_8b_lora"
-    ;;
-  *)
-    echo "Unsupported LLAVA_MODEL_SIZE=${MODEL_SIZE}. Use 4B or 8B." >&2
-    exit 2
-    ;;
-esac
-MODEL_NAME="${LLAVA_MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
-TRAIN_JSONL="${LLAVA_TRAIN_JSONL:-internvl3_finetune/train_full_ST_consensus_uncertain.jsonl}"
+MODEL_SIZE="4B"
+MODEL_NAME="lmms-lab/LLaVA-OneVision-1.5-4B-Instruct"
+TRAIN_JSONL="${LLAVA_TRAIN_JSONL:-internvl3_finetune/all_projects_label_only_SI_consensus_uncertain.jsonl}"
+TRAIN_JSONL_BASENAME="$(basename "${TRAIN_JSONL}")"
+DATASET_TAG="${TRAIN_JSONL_BASENAME#all_projects_label_only_}"
+DATASET_TAG="${DATASET_TAG#train_full_}"
+DATASET_TAG="${DATASET_TAG%.jsonl}"
+DATASET_TAG="${DATASET_TAG%_consensus_uncertain}"
 OUTPUT_ROOT="${LLAVA_OUTPUT_ROOT:-llava_onevision_finetune/checkpoints}"
-OUTPUT_PREFIX="${LLAVA_OUTPUT_PREFIX:-${DEFAULT_OUTPUT_PREFIX}}"
+OUTPUT_PREFIX="${LLAVA_OUTPUT_PREFIX:-llava_onevision_lora}"
 MAX_LENGTH="${LLAVA_MAX_LENGTH:-8192}"
+NUM_SAMPLED_FRAMES="${LLAVA_NUM_SAMPLED_FRAMES:-6}"
 PER_DEVICE_BATCH="${LLAVA_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRAD_ACCUM="${LLAVA_GRADIENT_ACCUMULATION_STEPS:-2}"
-EPOCHS="${LLAVA_NUM_TRAIN_EPOCHS:-10}"
-SAVE_TOTAL_LIMIT="${LLAVA_SAVE_TOTAL_LIMIT:-3}"
+EPOCHS="${LLAVA_NUM_TRAIN_EPOCHS:-5}"
+SAVE_TOTAL_LIMIT="${LLAVA_SAVE_TOTAL_LIMIT:-5}"
 PROJECTOR_LR="${LLAVA_PROJECTOR_LEARNING_RATE:-5e-5}"
 LLM_LR="${LLAVA_LLM_LEARNING_RATE:-1e-5}"
-WARMUP_RATIO="${LLAVA_WARMUP_RATIO:-0.1}"
+WARMUP_STEPS="${LLAVA_WARMUP_STEPS:-28}"
 LORA_ALPHA="${LLAVA_LORA_ALPHA:-32}"
 LORA_RANKS=(${LLAVA_LORA_RANKS:-4 8 16 32})
 
 for lora_r in "${LORA_RANKS[@]}"; do
-  output_dir="${OUTPUT_ROOT}/${OUTPUT_PREFIX}_${lora_r}_ST_consensus_uncertain_reason_sft"
+  output_dir="${OUTPUT_ROOT}/${OUTPUT_PREFIX}_${lora_r}_${DATASET_TAG}_consensus_uncertain_reason_sft"
 
   echo "=== LLaVA-OneVision ${MODEL_SIZE} SFT: lora_r=${lora_r} ==="
   echo "model_name=${MODEL_NAME}"
+  echo "train_jsonl=${TRAIN_JSONL}"
   echo "output_dir=${output_dir}"
+  echo "num_sampled_frames=${NUM_SAMPLED_FRAMES}"
 
   train_args=(
     train_llava_onevision_sft.py
@@ -65,15 +60,16 @@ for lora_r in "${LORA_RANKS[@]}"; do
     --lora_alpha "${LORA_ALPHA}" \
     --projector_learning_rate "${PROJECTOR_LR}" \
     --llm_learning_rate "${LLM_LR}" \
-    --warmup_ratio "${WARMUP_RATIO}" \
+    --warmup_steps "${WARMUP_STEPS}" \
+    --num_sampled_frames "${NUM_SAMPLED_FRAMES}" \
     --max_length "${MAX_LENGTH}"
   )
 
   if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
-    HF_HUB_OFFLINE="${HF_HUB_OFFLINE}" CUDA_VISIBLE_DEVICES="${GPU_IDS}" python -m torch.distributed.run \
+    OMP_NUM_THREADS="${OMP_NUM_THREADS}" HF_HUB_OFFLINE="${HF_HUB_OFFLINE}" CUDA_VISIBLE_DEVICES="${GPU_IDS}" python -m torch.distributed.run \
       --nproc_per_node="${NPROC_PER_NODE}" \
       "${train_args[@]}"
   else
-    HF_HUB_OFFLINE="${HF_HUB_OFFLINE}" CUDA_VISIBLE_DEVICES="${GPU_IDS}" python "${train_args[@]}"
+    OMP_NUM_THREADS="${OMP_NUM_THREADS}" HF_HUB_OFFLINE="${HF_HUB_OFFLINE}" CUDA_VISIBLE_DEVICES="${GPU_IDS}" python "${train_args[@]}"
   fi
 done

@@ -1,9 +1,30 @@
 import json
 import os
 import inspect
+import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+
+def sanitize_pytorch_cuda_alloc_conf() -> None:
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    if not alloc_conf:
+        return
+
+    entries = [entry.strip() for entry in alloc_conf.split(",") if entry.strip()]
+    supported_entries = [
+        entry for entry in entries if not entry.startswith("expandable_segments:")
+    ]
+    if len(supported_entries) == len(entries):
+        return
+    if supported_entries:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(supported_entries)
+    else:
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
+
+sanitize_pytorch_cuda_alloc_conf()
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
@@ -16,7 +37,6 @@ from torch.optim import AdamW
 from torch.utils.data import Dataset
 from transformers import (
     AutoModel,
-    AutoTokenizer,
     HfArgumentParser,
     set_seed,
     Trainer,
@@ -31,10 +51,12 @@ if str(ROOT_DIR) not in sys.path:
 
 from inference_common import setup_run_logging
 from inference_InternVL3 import (
-    build_prompt,
+    build_label_prompt,
     build_transform,
     configure_model_for_image_size,
     dynamic_preprocess,
+    load_internvl3_tokenizer,
+    patch_transformers_tied_weights_keys_compat,
     sample_video_frames,
 )
 
@@ -44,6 +66,21 @@ setup_run_logging("internvl3_train", __file__)
 IMG_START_TOKEN = "<img>"
 IMG_END_TOKEN = "</img>"
 IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+
+
+class IgnoreKnownTrainingNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        ignored_patterns = (
+            "`torch_dtype` is deprecated! Use `dtype` instead!",
+            "`use_return_dict` is deprecated! Use `return_dict` instead!",
+            "warmup_ratio is deprecated and will be removed in v5.2",
+        )
+        return not any(pattern in message for pattern in ignored_patterns)
+
+
+for logger_name in ("transformers.configuration_utils", "transformers.training_args"):
+    logging.getLogger(logger_name).addFilter(IgnoreKnownTrainingNoise())
 
 
 def patch_checkpoint_use_reentrant_default() -> None:
@@ -101,7 +138,7 @@ class ScriptTrainingArguments(TrainingArguments):
     save_total_limit: int = 3
     bf16: bool = True
     gradient_checkpointing: bool = True
-    warmup_ratio: float = 0.1
+    warmup_ratio: float | None = None
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -123,59 +160,23 @@ def load_jsonl(path: str) -> list[dict[str, Any]]:
 def format_target_json(example: dict[str, Any]) -> str:
     if "target_json" in example:
         target_json = example["target_json"]
-    elif "label" in example and "reason" in example:
-        target_json = {
-            "label": example["label"],
-            "reason": example["reason"],
-        }
-    elif "label" in example and "confidence" not in example and "reasons" not in example:
+    elif "label" in example:
         target_json = {
             "label": example["label"],
         }
     else:
-        for key in ("label", "confidence", "reasons"):
-            if key not in example:
-                raise KeyError(f"Training example must contain `target_json` or `{key}`.")
-        target_json = {
-            "label": example["label"],
-            "confidence": float(example["confidence"]),
-            "reasons": example["reasons"],
-        }
+        raise KeyError("Training example must contain `target_json` or `label`.")
 
     label = str(target_json["label"])
     if label not in {"real", "synthetic", "uncertain"}:
         raise ValueError(f"Unsupported label: {label!r}")
 
-    if "reason" in target_json:
-        reason = str(target_json["reason"]).strip()
-        if not reason:
-            raise ValueError("`reason` must be a non-empty string.")
-        return json.dumps({"label": label, "reason": reason}, ensure_ascii=False)
-
-    if "confidence" not in target_json and "reasons" not in target_json:
-        return json.dumps({"label": label}, ensure_ascii=False)
-    if "confidence" not in target_json or "reasons" not in target_json:
-        raise ValueError("Provide both `confidence` and `reasons`, or provide neither for label-only training.")
-
-    confidence = float(target_json["confidence"])
-    if not 0.0 <= confidence <= 1.0:
-        raise ValueError(f"Confidence must be between 0 and 1, got {confidence}.")
-
-    reasons = target_json["reasons"]
-    if not isinstance(reasons, list) or len(reasons) != 3:
-        raise ValueError("`reasons` must be a list of exactly 3 strings.")
-
-    payload = {
-        "label": label,
-        "confidence": confidence,
-        "reasons": [str(reason) for reason in reasons],
-    }
-    return json.dumps(payload, ensure_ascii=False)
+    return json.dumps({"label": label}, ensure_ascii=False)
 
 
 def build_question(num_frames: int) -> str:
     frame_placeholders = "\n".join(f"Frame {idx + 1}: <image>" for idx in range(num_frames))
-    return f"{frame_placeholders}\n\n{build_prompt()}"
+    return f"{frame_placeholders}\n\n{build_label_prompt()}"
 
 
 def expand_image_placeholders(text: str, num_patches_list: list[int], num_image_token: int) -> str:
@@ -576,14 +577,7 @@ def main() -> None:
     if not model_args.tune_projector and not model_args.llm_lora and model_args.freeze_vision:
         raise ValueError("Nothing is trainable. Enable projector tuning, LLM LoRA, or unfreeze vision.")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name,
-        trust_remote_code=True,
-        use_fast=False,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    tokenizer = load_internvl3_tokenizer(model_args.model_name)
 
     if training_args.bf16:
         training_dtype = torch.bfloat16
@@ -592,10 +586,11 @@ def main() -> None:
     else:
         training_dtype = torch.float32
 
+    patch_transformers_tied_weights_keys_compat()
     model = AutoModel.from_pretrained(
         model_args.model_name,
         trust_remote_code=True,
-        torch_dtype=training_dtype,
+        dtype=training_dtype,
         low_cpu_mem_usage=True,
         use_flash_attn=training_dtype != torch.float32,
     )
@@ -606,6 +601,11 @@ def main() -> None:
     )
     model.img_context_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
     model.config.use_cache = False
+    for token_attr in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        token_id = getattr(tokenizer, token_attr, None)
+        setattr(model.config, token_attr, token_id)
+        if hasattr(model, "generation_config"):
+            setattr(model.generation_config, token_attr, token_id)
 
     load_initial_projector_weights(model, model_args)
     freeze_model_for_projector_plus_llm_lora(model, model_args)
@@ -676,5 +676,13 @@ def main() -> None:
         print(f"Saved final finetuned artifacts to {final_output_dir}")
 
 
+def cleanup_distributed_process_group() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed_process_group()

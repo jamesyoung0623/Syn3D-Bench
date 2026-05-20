@@ -11,8 +11,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoProcessor
@@ -571,7 +569,7 @@ def attach_adapter_if_requested(model, settings: RuntimeSettings):
 
 def load_model_and_processor(settings: RuntimeSettings):
     load_kwargs = {
-        "torch_dtype": settings.torch_dtype,
+        "dtype": settings.torch_dtype,
     }
 
     if settings.load_in_8bit:

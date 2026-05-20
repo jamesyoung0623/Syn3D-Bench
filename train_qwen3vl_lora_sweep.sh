@@ -4,43 +4,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-GPU_IDS="${INTERNVL3_CUDA_VISIBLE_DEVICES:-0,1}"
-NPROC_PER_NODE="${INTERNVL3_NPROC_PER_NODE:-2}"
+GPU_IDS="${QWEN3VL_CUDA_VISIBLE_DEVICES:-0,1}"
+NPROC_PER_NODE="${QWEN3VL_NPROC_PER_NODE:-2}"
 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OMP_NUM_THREADS
-MODEL_SIZE="4B"
+MODEL_SIZE="2B"
 MODEL_SIZE_SLUG="${MODEL_SIZE,,}"
-MODEL_NAME="OpenGVLab/InternVL3_5-4B-Instruct"
-TRAIN_JSONL="${INTERNVL3_TRAIN_JSONL:-internvl3_finetune/all_projects_label_only_SI_consensus_uncertain.jsonl}"
+MODEL_NAME="Qwen/Qwen3-VL-2B-Instruct"
+DEFAULT_NUM_SAMPLED_FRAMES=6
+DEFAULT_FRAME_MAX_PIXELS=200704
+TRAIN_JSONL="${QWEN3VL_TRAIN_JSONL:-internvl3_finetune/all_projects_label_only_SI_consensus_uncertain.jsonl}"
 TRAIN_JSONL_BASENAME="$(basename "${TRAIN_JSONL}")"
 DATASET_TAG="${TRAIN_JSONL_BASENAME#all_projects_label_only_}"
 DATASET_TAG="${DATASET_TAG#train_full_}"
 DATASET_TAG="${DATASET_TAG%.jsonl}"
 DATASET_TAG="${DATASET_TAG%_consensus_uncertain}"
-OUTPUT_ROOT="${INTERNVL3_OUTPUT_ROOT:-internvl3_finetune/checkpoints}"
-OUTPUT_PREFIX="${INTERNVL3_OUTPUT_PREFIX:-internvl3_${MODEL_SIZE_SLUG}_lora}"
-NUM_SAMPLED_FRAMES="${INTERNVL3_NUM_SAMPLED_FRAMES:-6}"
-PER_DEVICE_BATCH="${INTERNVL3_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-GRAD_ACCUM="${INTERNVL3_GRADIENT_ACCUMULATION_STEPS:-2}"
-EPOCHS="${INTERNVL3_NUM_TRAIN_EPOCHS:-5}"
-SAVE_TOTAL_LIMIT="${INTERNVL3_SAVE_TOTAL_LIMIT:-5}"
-PROJECTOR_LR="${INTERNVL3_PROJECTOR_LEARNING_RATE:-5e-5}"
-LLM_LR="${INTERNVL3_LLM_LEARNING_RATE:-1e-5}"
-WARMUP_STEPS="${INTERNVL3_WARMUP_STEPS:-28}"
-LORA_ALPHA="${INTERNVL3_LORA_ALPHA:-32}"
-LORA_RANKS=(${INTERNVL3_LORA_RANKS:-4 8 16 32})
+OUTPUT_ROOT="${QWEN3VL_OUTPUT_ROOT:-qwen3vl_finetune/checkpoints}"
+OUTPUT_PREFIX="${QWEN3VL_OUTPUT_PREFIX:-qwen3vl_${MODEL_SIZE_SLUG}_lora}"
+PER_DEVICE_BATCH="${QWEN3VL_PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
+GRAD_ACCUM="${QWEN3VL_GRADIENT_ACCUMULATION_STEPS:-2}"
+EPOCHS="${QWEN3VL_NUM_TRAIN_EPOCHS:-5}"
+SAVE_TOTAL_LIMIT="${QWEN3VL_SAVE_TOTAL_LIMIT:-5}"
+MAX_LENGTH="${QWEN3VL_MAX_LENGTH:-4096}"
+NUM_SAMPLED_FRAMES="${QWEN3VL_NUM_SAMPLED_FRAMES:-${DEFAULT_NUM_SAMPLED_FRAMES}}"
+FRAME_MAX_PIXELS="${QWEN3VL_FRAME_MAX_PIXELS:-${DEFAULT_FRAME_MAX_PIXELS}}"
+LORA_ALPHA="${QWEN3VL_LORA_ALPHA:-32}"
+LLM_LR="${QWEN3VL_LLM_LEARNING_RATE:-1e-5}"
+WARMUP_STEPS="${QWEN3VL_WARMUP_STEPS:-28}"
+LORA_RANKS=(${QWEN3VL_LORA_RANKS:-4 8 16 32})
 
 for lora_r in "${LORA_RANKS[@]}"; do
   output_dir="${OUTPUT_ROOT}/${OUTPUT_PREFIX}_${lora_r}_${DATASET_TAG}_consensus_uncertain_reason_sft"
 
-  echo "=== InternVL3 ${MODEL_SIZE} SFT: lora_r=${lora_r} ==="
+  echo "=== Qwen3-VL ${MODEL_SIZE} SFT: lora_r=${lora_r} ==="
   echo "model_name=${MODEL_NAME}"
   echo "train_jsonl=${TRAIN_JSONL}"
   echo "output_dir=${output_dir}"
   echo "num_sampled_frames=${NUM_SAMPLED_FRAMES}"
-
+  echo "frame_max_pixels=${FRAME_MAX_PIXELS}"
+  echo "max_length=${MAX_LENGTH}"
   train_args=(
-    train_internvl3_sft.py
+    train_qwen2vl_sft.py
     --model_name "${MODEL_NAME}" \
     --train_jsonl "${TRAIN_JSONL}" \
     --output_dir "${output_dir}" \
@@ -52,14 +56,14 @@ for lora_r in "${LORA_RANKS[@]}"; do
     --save_total_limit "${SAVE_TOTAL_LIMIT}" \
     --bf16 True \
     --gradient_checkpointing True \
-    --tune_projector True \
     --llm_lora True \
     --lora_r "${lora_r}" \
     --lora_alpha "${LORA_ALPHA}" \
-    --projector_learning_rate "${PROJECTOR_LR}" \
     --llm_learning_rate "${LLM_LR}" \
+    --warmup_steps "${WARMUP_STEPS}" \
+    --max_length "${MAX_LENGTH}" \
     --num_sampled_frames "${NUM_SAMPLED_FRAMES}" \
-    --warmup_steps "${WARMUP_STEPS}"
+    --frame_max_pixels "${FRAME_MAX_PIXELS}"
   )
 
   if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then

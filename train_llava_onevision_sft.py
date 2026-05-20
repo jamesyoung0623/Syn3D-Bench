@@ -1,16 +1,35 @@
 import inspect
 import json
+import logging
 import os
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+
+def sanitize_pytorch_cuda_alloc_conf() -> None:
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    if not alloc_conf:
+        return
+
+    entries = [entry.strip() for entry in alloc_conf.split(",") if entry.strip()]
+    supported_entries = [
+        entry for entry in entries if not entry.startswith("expandable_segments:")
+    ]
+    if len(supported_entries) == len(entries):
+        return
+    if supported_entries:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(supported_entries)
+    else:
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
+
+sanitize_pytorch_cuda_alloc_conf()
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import cv2
 import numpy as np
 import torch
@@ -52,6 +71,21 @@ warnings.filterwarnings(
 )
 
 
+class IgnoreKnownTrainingNoise(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        ignored_patterns = (
+            "`torch_dtype` is deprecated! Use `dtype` instead!",
+            "`use_return_dict` is deprecated! Use `return_dict` instead!",
+            "warmup_ratio is deprecated and will be removed in v5.2",
+        )
+        return not any(pattern in message for pattern in ignored_patterns)
+
+
+for logger_name in ("transformers.configuration_utils", "transformers.training_args"):
+    logging.getLogger(logger_name).addFilter(IgnoreKnownTrainingNoise())
+
+
 @dataclass
 class ModelDataArguments:
     model_size: str = "4B"
@@ -85,7 +119,7 @@ class ScriptTrainingArguments(TrainingArguments):
     save_total_limit: int = 3
     bf16: bool = True
     gradient_checkpointing: bool = True
-    warmup_ratio: float = 0.1
+    warmup_ratio: float | None = None
 
 
 def patch_checkpoint_use_reentrant_default() -> None:
@@ -503,7 +537,7 @@ def load_model(args: ModelDataArguments, torch_dtype: torch.dtype):
     load_errors = []
     load_kwargs = {
         "trust_remote_code": True,
-        "torch_dtype": torch_dtype,
+        "dtype": torch_dtype,
         "low_cpu_mem_usage": True,
     }
     if args.attn_implementation.strip():
@@ -829,5 +863,13 @@ def main() -> None:
         print(f"Saved final finetuned artifacts to {final_output_dir}")
 
 
+def cleanup_distributed_process_group() -> None:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed_process_group()
